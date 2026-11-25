@@ -1,0 +1,112 @@
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+# For GitHub repositories, enable PR triggers here.
+# For Azure Repos, configure Build Validation under Branch Policies.
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  TRUFFLEHOG_IMAGE: 'ghcr.io/trufflesecurity/trufflehog:latest'
+
+steps:
+
+# STEP 1: Checkout the complete Git history
+- checkout: self
+  clean: true
+  fetchDepth: 0
+  displayName: 'Checkout Repository with Full Git History'
+
+# STEP 2: Prepare report directory
+- task: Bash@3
+  displayName: 'Prepare TruffleHog Scan'
+  inputs:
+    targetType: 'inline'
+    script: |
+      set -euo pipefail
+
+      echo "Checking Docker installation..."
+      docker version
+
+      mkdir -p "$(Build.ArtifactStagingDirectory)/trufflehog"
+
+      echo "Pulling TruffleHog image..."
+      docker pull "$(TRUFFLEHOG_IMAGE)"
+
+      echo "TruffleHog environment ready."
+
+# STEP 3: Run TruffleHog secret scanning
+- task: Bash@3
+  displayName: 'TruffleHog - Git Secret Detection'
+  inputs:
+    targetType: 'inline'
+    script: |
+      set -u
+
+      REPO_PATH="$(Build.SourcesDirectory)"
+      REPORT_DIR="$(Build.ArtifactStagingDirectory)/trufflehog"
+      REPORT="$REPORT_DIR/trufflehog-report.json"
+      LOG="$REPORT_DIR/trufflehog-scan.log"
+
+      echo "========================================"
+      echo "       TRUFFLEHOG SECRET SCANNING"
+      echo "========================================"
+
+      echo "Repository: $REPO_PATH"
+      echo "Scanning complete Git history..."
+
+      set +e
+
+      docker run --rm \
+        -v "$REPO_PATH:/repo:ro" \
+        "$(TRUFFLEHOG_IMAGE)" \
+        --json \
+        --no-update \
+        --results=verified,unknown,unverified \
+        --fail \
+        git file:///repo \
+        > "$REPORT" 2> "$LOG"
+
+      SCAN_EXIT_CODE=$?
+
+      set -e
+
+      echo "========== SCAN LOG =========="
+      cat "$LOG" || true
+
+      echo "========== SCAN SUMMARY =========="
+
+      if [ -s "$REPORT" ]; then
+        echo "JSON report generated."
+        echo "Finding count:"
+        jq -s 'length' "$REPORT" || true
+      else
+        echo "No JSON findings report was generated."
+      fi
+
+      if [ "$SCAN_EXIT_CODE" -eq 0 ]; then
+        echo "SUCCESS: No secrets detected."
+        exit 0
+      elif [ "$SCAN_EXIT_CODE" -eq 183 ]; then
+        echo "SECURITY FAILURE: TruffleHog detected secrets."
+        echo "Review the published security report."
+        exit 183
+      else
+        echo "ERROR: TruffleHog scan failed."
+        echo "Exit code: $SCAN_EXIT_CODE"
+        exit "$SCAN_EXIT_CODE"
+      fi
+
+# STEP 4: Publish reports, even if scanning fails
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish TruffleHog Security Reports'
+  condition: always()
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)/trufflehog'
+    ArtifactName: 'TruffleHog-Secret-Scan-Reports'
+    publishLocation: 'Container'
